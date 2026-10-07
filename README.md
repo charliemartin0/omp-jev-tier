@@ -18,7 +18,7 @@ Never overridden: an explicit `model` on the task call, an agent that pins a rol
 
 ## 2. Automatic plan mode (`input`)
 
-On each message you submit in the main session's interactive TUI, Jev judges `plan` vs `direct`. On `plan` with confidence >= 0.75 the hook rewrites the input to `/plan <your message>`, the path the slash command takes. A `Plan mode: <reason>` line follows omp's own `Plan mode enabled` line. As with a manual `/plan`, omp switches to your `plan` role model.
+On each message you submit in the main session's interactive TUI, Jev judges `plan` vs `direct`. A message that plainly asks for a plan ("make/write/create a plan", "plan this/out", "let's plan", "plan first", unless negated in the same clause) switches without calling Jev. Otherwise, on a Jev `plan` verdict with confidence >= 0.6 the hook rewrites the input to `/plan <your message>`, the path the slash command takes. A `Plan mode: <reason>` line follows omp's own `Plan mode enabled` line. As with a manual `/plan`, omp switches to your `plan` role model.
 
 It never acts when: the session is in plan, paused plan, goal or vibe mode; an approved plan is being executed; the agent is busy; `plan.enabled` is off; this is a subagent session; the message starts with omp syntax (`/`, `!`, `!!`, `$`, `->`, `=>`); or the message contains an omp magic keyword (`jevify`, `orchestrate`, `workflowz`, `ultrathink`, matched by omp's own rules and only while `magicKeywords.enabled` and the keyword's switch are on).
 
@@ -43,7 +43,7 @@ To skip detection for one message, say so in it: "no plan", "skip planning", "do
 
 - Whole extension: `JEV_TIER=off omp`.
 - Plan detection only: `JEV_PLAN=off`.
-- Persistent: `~/.omp/agent/extensions/jev-tier/config.json`, e.g. `{"enabled": false}` or `{"planEnabled": false}`. Tuning keys: `timeoutMs` (1-3000), `minConfidence` (tiers, 0.7), `planMinConfidence` (0.75).
+- Persistent: `~/.omp/agent/extensions/jev-tier/config.json`, e.g. `{"enabled": false}` or `{"planEnabled": false}`. Tuning keys: `timeoutMs` (1-3000; the plan check scales it up to 8s as the message grows from 500 to 2000 characters; a timeout fails open and is logged as `jev error: timeout after Nms`), `minConfidence` (tiers, 0.7), `planMinConfidence` (0.6).
 
 ## Test
 

@@ -3,7 +3,7 @@ import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, TaskIndex, askChoice, decide, explicitReason, formatLog, type JudgeFn, type JudgeRequest, type SpawnEvent } from "./core";
-import { findMagicKeyword } from "./plan";
+import { explicitPlanRequest, findMagicKeyword, planTimeoutMs } from "./plan";
 import { register, type ExtensionContext } from "./register";
 
 const config = { ...DEFAULT_CONFIG };
@@ -17,6 +17,8 @@ interface Script {
 	choice?: string;
 	confidence?: number;
 	fail?: boolean;
+	/** Resolve this many ms late; ignores the abort signal, like a slow network call. */
+	delayMs?: number;
 }
 
 function scripted(script: Script = {}) {
@@ -31,6 +33,11 @@ function scripted(script: Script = {}) {
 		assert.ok(Object.values(question.criteria).every((label) => typeof label === "string" && label.length > 0), "criteria must be strings");
 		assert.ok(request.purpose.startsWith("jev-tier:"));
 		if (script.fail) throw new Error("forced judge failure");
+		if (script.delayMs) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, script.delayMs);
+			await promise;
+		}
 		const choice = script.choice ?? Object.keys(question.criteria)[0];
 		return { answers: { [ids[0]]: { type: "choice", choice, probabilities: { [choice]: script.confidence ?? 0.9 }, confidence: script.confidence ?? 0.9 } } };
 	};
@@ -255,8 +262,33 @@ async function runPlanChecks(): Promise<void> {
 	assert.equal(abandoned.result?.text, `/plan ${planText}`);
 
 	// 8. thresholds, busy agent, subagent, toggles
-	assert.equal((await sendMessage(planText, { choice: "plan", confidence: 0.74 })).result, undefined);
-	assert.equal((await sendMessage(planText, { choice: "plan", confidence: 0.75 })).result?.text, `/plan ${planText}`);
+	assert.equal((await sendMessage(planText, { choice: "plan", confidence: 0.59 })).result, undefined);
+	assert.equal((await sendMessage(planText, { choice: "plan", confidence: 0.6 })).result?.text, `/plan ${planText}`, "plan verdict at 0.6 switches");
+	// the exact message from the log (plan 0.54 was skipped at 0.75) now switches without asking Jev
+	const logged = "Please make a plan to fix the rejected creative logic as mentioned before";
+	const asked = await sendMessage(logged, { choice: "direct", confidence: 0.99 });
+	assert.equal(asked.result?.text, `/plan ${logged}`);
+	assert.equal(asked.calls.length, 0, "an explicit request never calls Jev");
+	assert.deepEqual(asked.notices, ["Plan mode: you asked for a plan"]);
+	// explicit-request gates: opt-out and magic keywords still win, and a negated request is not a request
+	for (const text of ["Please make a plan to fix it, don't plan too much", "Write a plan for the migration, just do it", "orchestrate this: make a plan for the migration"]) {
+		const r = await sendMessage(text, { choice: "direct", confidence: 0.99 });
+		assert.equal(r.result, undefined, text);
+	}
+	const refused = await sendMessage("Don't plan this, fix the typo in src/a.ts", { choice: "plan", confidence: 0.99 });
+	assert.equal(refused.result, undefined, "explicit don't-plan skips");
+	assert.equal(refused.calls.length, 0);
+	// a long pasted spec: Jev answers after 3.3s, past the 3s short-message budget but inside the scaled one
+	const spec = `Build a retry subsystem.\n${"The importer must be idempotent and report progress per batch. ".repeat(60)}`;
+	const longSpec = await sendMessage(spec, { choice: "plan", confidence: 0.9, delayMs: 3300 });
+	assert.equal(longSpec.result?.text, `/plan ${spec.trim()}`, "long message must not time out at 3s");
+	assert.equal(longSpec.calls.length, 1);
+	assert.equal((longSpec.calls[0].state.message as string).length, 2000);
+	assert.equal(planTimeoutMs(3000, 100), 3000);
+	assert.equal(planTimeoutMs(3000, 500), 3000);
+	assert.equal(planTimeoutMs(3000, 1250), 5500);
+	assert.equal(planTimeoutMs(3000, 2000), 8000);
+	assert.equal(planTimeoutMs(3000, 50_000), 8000);
 	const busy = await sendMessage(planText, { idle: false, choice: "plan", confidence: 0.99 });
 	assert.equal(busy.result, undefined);
 	assert.equal(busy.calls.length, 0);
@@ -277,6 +309,39 @@ async function runPlanChecks(): Promise<void> {
 	const log = readFileSync(logFile, "utf8");
 	assert.ok(log.split("\n").every((line) => !line || line.includes("kind=plan")));
 	console.log("PASS plan: switch, direct, opt-out + untouched !/ shortcuts, magic keywords, judge failure, already planning, approved plan, thresholds, toggles");
+}
+
+function runExplicitPlanChecks(): void {
+	for (const text of [
+		"Please make a plan to fix the rejected creative logic",
+		"write me a detailed plan for the cache",
+		"Create a plan",
+		"let's plan",
+		"Let's plan the rollout",
+		"can you plan this out",
+		"plan this first",
+		"plan out the migration",
+		"plan first, then implement",
+	]) {
+		assert.equal(explicitPlanRequest(text), true, text);
+	}
+	for (const text of [
+		"Don't make a plan",
+		"there's no need to write a plan",
+		"I plan this week to ship it",
+		"we plan to refactor later",
+		"update plan.md",
+		"create a plan.md file",
+		"what does the plan look like?",
+		"```\nmake a plan\n```",
+		"read `make a plan` in the docs",
+		"make a planner",
+	]) {
+		assert.equal(explicitPlanRequest(text), false, text);
+	}
+	assert.equal(explicitPlanRequest("make a plan"), true, "matcher must be stateless between calls");
+	assert.equal(explicitPlanRequest("make a plan"), true);
+	console.log("PASS explicit plan: phrases, negation, code spans, false positives");
 }
 
 // At most one judgment per message and per spawn for the same decision, driven through the real hooks.
@@ -301,6 +366,7 @@ await runTierChecks();
 await runPinChecks();
 await runTimeoutCheck();
 runKeywordChecks();
+runExplicitPlanChecks();
 await runPlanChecks();
 await runSingleCallChecks();
 console.log(`\n--- plan log lines from this run (${logFile}) ---`);

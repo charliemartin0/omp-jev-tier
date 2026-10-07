@@ -22,7 +22,7 @@ export interface Config {
 	planMinConfidence: number;
 }
 
-export const DEFAULT_CONFIG: Config = { enabled: true, timeoutMs: 3000, minConfidence: 0.7, planEnabled: true, planMinConfidence: 0.75 };
+export const DEFAULT_CONFIG: Config = { enabled: true, timeoutMs: 3000, minConfidence: 0.7, planEnabled: true, planMinConfidence: 0.6 };
 
 export interface TaskItem {
 	name?: string;

@@ -27,17 +27,50 @@ const RX = {
 	optOut: /\b(no plan(?:ning)?|skip (?:the )?plan(?:ning)?|don'?t plan|do not plan|without (?:a )?plan(?:ning)?|no need (?:to|for) plan\w*|just do it)\b/i,
 };
 
-// omp's magic keywords: exact lowercase standalone words in prose. Fenced code, inline code and HTML are ignored,
-// and a word glued to letters, digits, `_`, `/`, `\`, `-`, a file extension, `::` or call syntax does not count.
-const MAGIC_KEYWORD_RX = /(?<![\w/\\.:-])(jevify|orchestrate|workflowz|ultrathink)(?![\w/\\(-])(?!\.\w)(?!::)/;
+// A plain request for a plan: "make/write/create a plan", "plan this (out)", "plan out", "let's plan", "plan first".
+// "I/we plan this week" is a statement, not a request, so a leading pronoun and time words rule `plan this` out.
+const EXPLICIT_PLAN_RX =
+	/\b(?:(?:make|write|create)\s+(?:me\s+)?(?:a|an|the)\s+(?:[\w-]+\s+){0,2}plan(?![\w./-])|(?<!\b(?:i|we|they)\s+)plan\s+(?:(?:this|that|it)\b(?!\s+(?:week|month|year|weekend|morning|afternoon|evening|tonight|today|tomorrow|to)\b)|out\b)|let'?s\s+plan\b|plan\s+first\b)/gi;
+// Negation earlier in the same clause ("don't make a plan", "no need to write a plan") cancels the request.
+const NEGATION_RX = /\b(?:not|never|no|without|skip)\b|n'?t\b/i;
 
-export function findMagicKeyword(text: string): string | undefined {
-	const prose = text
+// Prose only: fenced code, inline code and HTML are ignored.
+function proseOf(text: string): string {
+	return text
 		.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, " ")
 		.replace(/`[^`\n]*`/g, " ")
 		.replace(/<!--[\s\S]*?-->|<([A-Za-z][\w:-]*)\b[^>]*>[\s\S]*?<\/\1>/g, " ")
 		.replace(/<[A-Za-z/][^>]*>/g, " ");
-	return MAGIC_KEYWORD_RX.exec(prose)?.[1];
+}
+
+// omp's magic keywords: exact lowercase standalone words in prose (see proseOf), and a word glued to letters,
+// digits, `_`, `/`, `\`, `-`, a file extension, `::` or call syntax does not count.
+const MAGIC_KEYWORD_RX = /(?<![\w/\\.:-])(jevify|orchestrate|workflowz|ultrathink)(?![\w/\\(-])(?!\.\w)(?!::)/;
+
+export function findMagicKeyword(text: string): string | undefined {
+	return MAGIC_KEYWORD_RX.exec(proseOf(text))?.[1];
+}
+
+// True when the message plainly asks for a plan, without a negation in the same clause before the phrase.
+export function explicitPlanRequest(text: string): boolean {
+	const prose = proseOf(text);
+	for (const match of prose.matchAll(EXPLICIT_PLAN_RX)) {
+		const clause = prose.slice(Math.max(0, match.index - 40), match.index).split(/[.!?,;:\n]/).pop() ?? "";
+		if (!NEGATION_RX.test(clause)) return true;
+	}
+	return false;
+}
+
+// Jev sees at most this many characters of the message.
+const PLAN_STATE_CHARS = 2000;
+const PLAN_TIMEOUT_MAX_MS = 8000;
+const PLAN_SCALE_FROM_CHARS = 500;
+
+// The Jev call gets the base timeout for short messages, rising linearly to 8s as the message sent grows from
+// 500 to 2000 characters, so a long pasted spec is not cut off at the short-message budget.
+export function planTimeoutMs(baseMs: number, chars: number): number {
+	const fraction = Math.min(1, Math.max(0, (chars - PLAN_SCALE_FROM_CHARS) / (PLAN_STATE_CHARS - PLAN_SCALE_FROM_CHARS)));
+	return Math.max(baseMs, Math.round(baseMs + (PLAN_TIMEOUT_MAX_MS - baseMs) * fraction));
 }
 
 // Leading syntax omp interprets itself: slash commands, `!`/`!!` shell, `$`/`$$` python, `->`/`=>` steer.
@@ -163,18 +196,23 @@ export async function decidePlan(input: PlanDecideInput): Promise<PlanDecision> 
 	if (approvedPlanInFlight(input.session.entries)) return skip("executing an approved plan");
 	if (!input.idle) return skip("agent is busy; message would queue as a steer");
 
+	if (explicitPlanRequest(text)) {
+		return { action: "switch", verdict: "plan", confidence: 1, reason: "you asked for a plan", summary };
+	}
+
 	const paths = extractPaths(text);
 	const signals = detectPlanSignals(text, paths);
+	const sent = text.slice(0, PLAN_STATE_CHARS);
 	let answer: { choice: PlanVerdict; confidence: number };
 	try {
 		answer = await askChoice({
 			judge: input.judge,
-			state: { message: text.slice(0, 2000), paths, signals },
+			state: { message: sent, paths, signals },
 			questionId: "plan_route",
 			question: planQuestion(),
 			choices: PLAN_VERDICTS,
 			purpose: "jev-tier:plan_route",
-			timeoutMs: config.timeoutMs,
+			timeoutMs: planTimeoutMs(config.timeoutMs, sent.length),
 		});
 	} catch (error) {
 		const msg = redact(error instanceof Error ? error.message : String(error), secrets).slice(0, 120);
