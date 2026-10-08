@@ -1,12 +1,15 @@
 import { strict as assert } from "node:assert";
-import { readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { DEFAULT_CONFIG, TIMEOUT_CAP_MS, TaskIndex, askChoice, decide, explicitReason, formatLog, parseConfig, spawnTimeoutMs, type JudgeFn, type JudgeRequest, type SpawnEvent } from "./core";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, relative, resolve } from "node:path";
+import { DEFAULT_CONFIG, TIMEOUT_CAP_MS, TaskIndex, askChoice, decide, explicitReason, formatLog, isOff, isPlanOff, parseConfig, spawnTimeoutMs, type JudgeFn, type JudgeRequest, type SpawnEvent } from "./core";
 import { explicitPlanRequest, findMagicKeyword, planTimeoutMs } from "./plan";
 import { register, type ExtensionContext } from "./register";
 
-const config = { ...DEFAULT_CONFIG };
+const config = parseConfig(undefined);
+const testRoot = mkdtempSync(join(tmpdir(), "jev-tier-test-"));
+const envKeys = ["JEV_TIER", "JEV_PLAN", "JEV_TIER_CONFIG"] as const;
+const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
 const currentModel = "anthropic/claude-sonnet-5-5";
 const baseEvent: SpawnEvent = { agent: "task", invocationKind: "task", patterns: [`${currentModel}:high`], spawnKey: "sample" };
 const when = new Date("2026-10-06T00:00:00.000Z");
@@ -17,6 +20,7 @@ interface Script {
 	choice?: string;
 	confidence?: number;
 	fail?: boolean;
+	errorMessage?: string;
 	/** Resolve this many ms late; ignores the abort signal, like a slow network call. */
 	delayMs?: number;
 	/** Per question id answers, overriding `choice`/`confidence`. */
@@ -38,7 +42,7 @@ function scripted(script: Script = {}) {
 			assert.ok(Object.values(question.criteria).every((label) => typeof label === "string" && label.length > 0), "criteria must be strings");
 		}
 		assert.ok(request.purpose.startsWith("jev-tier:"));
-		if (script.fail) throw new Error("forced judge failure");
+		if (script.fail) throw new Error(script.errorMessage ?? "forced judge failure");
 		if (script.delayMs) {
 			const { promise, resolve } = Promise.withResolvers<void>();
 			setTimeout(resolve, script.delayMs);
@@ -110,14 +114,9 @@ async function runTierChecks(): Promise<void> {
 		assert.equal(written.model, "@smol");
 		assert.equal(written.reason, "jev choice");
 	}
-	const tierInstructions = testWriting.calls[0].questions.model_tier.instructions;
-	assert.match(tierInstructions, /writes or extends tests following existing patterns can be quick/);
-	assert.match(tierInstructions, /Debugging failing tests, fixing flaky tests, or test-infrastructure changes are medium or above/);
-	assert.match(tierInstructions, /When unsure between two tiers, pick the higher one/);
-	assert.doesNotMatch(tierInstructions, /never quick/);
 
 	const secret = await decide({ event: baseEvent, pending: pending("Summarize API_KEY=secret-value-1234567890 and auth config"), currentModel, config, judge: scripted({ choice: "quick" }).judge });
-	assert.ok(!formatLog(secret, baseEvent).includes("secret-value-1234567890"));
+	assert.ok(!formatLog(secret, baseEvent, when, true).includes("secret-value-1234567890"), "text opt-in must still redact credentials");
 	console.log(lines.join("\n"));
 	console.log("PASS tier: heavy / medium / quick, judge failure fail-open, test-writing can be quick, log redaction, native question shape");
 }
@@ -195,9 +194,6 @@ async function runTimeoutScalingChecks(): Promise<void> {
 // ---------------------------------------------------------------- batched spawn tiering
 
 async function runBatchChecks(): Promise<void> {
-	rmSync(logFile, { force: true });
-	delete process.env.JEV_TIER;
-	delete process.env.JEV_PLAN;
 	type Routed = { model?: string } | undefined;
 	const item = (name: string, extra: Record<string, unknown> = {}) => ({ name, agent: "task", task: `Work item ${name}: adjust src/${name}.ts`, ...extra });
 	const send = (h: Harness, tasks: unknown[], context = "Shared batch context") =>
@@ -237,9 +233,9 @@ async function runBatchChecks(): Promise<void> {
 	send(failed, failNames.map((n) => item(n)));
 	assert.deepEqual(await spawnAll(failed, failNames), [undefined, undefined, undefined]);
 	assert.equal(failed.calls.length, 1);
-	const failLines = readFileSync(logFile, "utf8").split("\n").filter((line) => line.includes("spawn=BatchFail"));
+	const failLines = readFileSync(failed.logFile, "utf8").split("\n").filter((line) => line.includes('spawn="BatchFail'));
 	assert.equal(failLines.length, 3);
-	assert.ok(failLines.every((line) => line.includes('reason="jev error: forced judge failure"')));
+	assert.ok(failLines.every((line) => line.includes('reason="jev error"')), "metadata mode must not persist judge error details");
 
 	// 4. one unusable answer fails open for that spawn alone
 	const omitNames = named("BatchOmit");
@@ -301,9 +297,16 @@ interface Scenario extends Script {
 	idle?: boolean;
 	agentKind?: string;
 	magicActive?: boolean;
+	planAvailable?: boolean;
+	config?: unknown;
+	/** Undefined creates a valid empty config; useDefaultConfig leaves the natural default missing. */
+	useDefaultConfig?: boolean;
+	configPath?: string;
+	useDefaultLog?: boolean;
+	logPath?: string;
+	judgeFn?: JudgeFn;
 }
 
-const logFile = join(tmpdir(), "jev-tier-test.log");
 type Handler = (event: unknown, context: ExtensionContext) => unknown;
 
 interface Harness {
@@ -311,18 +314,35 @@ interface Harness {
 	calls: JudgeRequest[];
 	notices: string[];
 	context: ExtensionContext;
+	root: string;
+	agentDir: string;
+	configPath: string;
+	logFile: string;
 }
 
 function harness(scenario: Scenario = {}): Harness {
+	const root = mkdtempSync(join(testRoot, "fixture-"));
+	const agentDir = join(root, "agent");
+	const selectedPath = scenario.configPath ?? (scenario.useDefaultConfig
+		? join(agentDir, "extensions", "jev-tier", "config.json")
+		: join(root, "selected", "config.json"));
+	const configPath = resolve(selectedPath.startsWith("~/") ? join(homedir(), selectedPath.slice(2)) : selectedPath);
+	if (scenario.config !== undefined || !scenario.useDefaultConfig) {
+		mkdirSync(dirname(configPath), { recursive: true });
+		writeFileSync(configPath, JSON.stringify(scenario.config ?? {}));
+	}
+	const logFile = resolve(scenario.logPath ?? (scenario.useDefaultLog ? join(agentDir, "logs", "jev-tier.log") : join(root, "logs", "fixture.log")));
 	const handlers: Record<string, Handler> = {};
 	const { judge, calls } = scripted(scenario);
 	register(
 		{ on: (event, handler) => void (handlers[event] = handler) },
 		{
-			planModeAvailable: () => true,
+			agentDir,
+			configPath: scenario.useDefaultConfig ? undefined : selectedPath,
+			planModeAvailable: () => scenario.planAvailable ?? true,
 			magicKeywordActive: () => scenario.magicActive ?? true,
-			judge: (_context, request) => judge(request),
-			logPath: logFile,
+			judge: (_context, request) => scenario.judgeFn ? scenario.judgeFn(request) : judge(request),
+			logPath: scenario.useDefaultLog ? undefined : scenario.logPath ?? logFile,
 		},
 	);
 	const notices: string[] = [];
@@ -335,19 +355,16 @@ function harness(scenario: Scenario = {}): Harness {
 		models: { current: () => ({ provider: "anthropic", id: "claude-sonnet-5-5" }) },
 		sessionManager: { buildSessionContext: () => ({ mode: scenario.mode ?? "none" }), getEntries: () => scenario.entries ?? [] },
 	};
-	return { handlers, calls, notices, context };
+	return { handlers, calls, notices, context, root, agentDir, configPath, logFile };
 }
 
 async function sendMessage(text: string, scenario: Scenario = {}) {
-	const { handlers, calls, notices, context } = harness(scenario);
+	const { handlers, calls, notices, context, logFile } = harness(scenario);
 	const result = (await handlers.input({ text, source: "interactive" }, context)) as { text?: string } | undefined;
-	return { result, calls, notices };
+	return { result, calls, notices, logFile };
 }
 
 async function runPlanChecks(): Promise<void> {
-	rmSync(logFile, { force: true });
-	delete process.env.JEV_TIER;
-	delete process.env.JEV_PLAN;
 
 	// 1. clear plan case -> input rewritten to /plan <message>, one-line notice, exactly one judgment
 	const planText = "Add retry and idempotency handling to the sync job across src/api/sync.ts and src/worker/sync.ts";
@@ -450,7 +467,7 @@ async function runPlanChecks(): Promise<void> {
 	assert.equal(tierOff.calls.length, 0);
 	delete process.env.JEV_TIER;
 
-	const log = readFileSync(logFile, "utf8");
+	const log = readFileSync(plan.logFile, "utf8");
 	assert.ok(log.split("\n").every((line) => !line || line.includes("kind=plan")));
 	console.log("PASS plan: switch, direct, opt-out + untouched !/ shortcuts, magic keywords, judge failure, already planning, approved plan, thresholds, toggles");
 }
@@ -506,14 +523,451 @@ async function runSingleCallChecks(): Promise<void> {
 	console.log("PASS single-call: 1 judgment per message, 1 per spawn (a second dispatch of the same key judges once more, by design)");
 }
 
-await runTierChecks();
-await runPinChecks();
-await runTimeoutCheck();
-await runTimeoutScalingChecks();
-await runBatchChecks();
-runKeywordChecks();
-runExplicitPlanChecks();
-await runPlanChecks();
-await runSingleCallChecks();
-console.log(`\n--- plan log lines from this run (${logFile}) ---`);
-console.log(readFileSync(logFile, "utf8").trimEnd());
+// ---------------------------------------------------------------- configuration and live hooks
+
+type Routed = { model: string; note?: string } | undefined;
+type Rewritten = { text: string } | undefined;
+const featureText = "Add retry handling across src/api/sync.ts and src/worker/sync.ts";
+const configWarning = "jev-tier: cannot read configuration; routing disabled until fixed";
+
+function rewriteConfig(h: Harness, value: unknown): void {
+	mkdirSync(dirname(h.configPath), { recursive: true });
+	writeFileSync(h.configPath, JSON.stringify(value));
+}
+
+async function route(h: Harness, name = "ConfiguredTask", task = "Summarize src/a.ts"): Promise<Routed> {
+	h.handlers.tool_call({ toolName: "task", input: { tasks: [{ name, agent: "task", task }] } }, h.context);
+	return await h.handlers.before_subagent_spawn({ ...baseEvent, modelRole: "task", spawnKey: name }, h.context) as Routed;
+}
+
+async function message(h: Harness, text = featureText): Promise<Rewritten> {
+	return await h.handlers.input({ text, source: "interactive" }, h.context) as Rewritten;
+}
+
+async function withEnv(values: Partial<Record<typeof envKeys[number], string>>, run: () => Promise<void>): Promise<void> {
+	const previous = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+	try {
+		for (const key of envKeys) {
+			if (values[key] === undefined) delete process.env[key];
+			else process.env[key] = values[key];
+		}
+		await run();
+	} finally {
+		for (const key of envKeys) {
+			if (previous[key] === undefined) delete process.env[key];
+			else process.env[key] = previous[key];
+		}
+	}
+}
+
+async function runConfigurationChecks(): Promise<void> {
+	assert.deepEqual(parseConfig(undefined), DEFAULT_CONFIG);
+	for (const raw of [null, false, "invalid", [], [{ enabled: false }]]) assert.deepEqual(parseConfig(raw), DEFAULT_CONFIG);
+	const partial = parseConfig({ tierModels: { quick: "  @default  ", ignored: "@unused" }, logging: { includeText: true, ignored: true }, unknown: true });
+	assert.deepEqual(partial.tierModels, { heavy: "@slow", medium: "@default", quick: "@default" });
+	assert.deepEqual(partial.logging, { enabled: true, includeText: true });
+	assert.ok(!("unknown" in partial));
+	const first = parseConfig(undefined);
+	const second = parseConfig(undefined);
+	first.tierModels.quick = "test/mutated";
+	first.logging.enabled = false;
+	first.logging.path = "mutated.log";
+	assert.deepEqual(second, DEFAULT_CONFIG, "each parse owns fresh nested defaults");
+	assert.equal(DEFAULT_CONFIG.tierModels.quick, "@smol");
+	assert.deepEqual(DEFAULT_CONFIG.logging, { enabled: true, includeText: false });
+	for (const invalid of [undefined, null, false, [], { heavy: "", medium: 42, quick: "   " }]) {
+		assert.deepEqual(parseConfig({ tierModels: invalid }).tierModels, DEFAULT_CONFIG.tierModels);
+	}
+	for (const invalid of [null, false, [], { enabled: "false", includeText: 1, path: " " }]) {
+		assert.deepEqual(parseConfig({ logging: invalid }).logging, DEFAULT_CONFIG.logging);
+	}
+	assert.deepEqual(parseConfig({ logging: { enabled: false, path: "  logs/custom.log  " } }).logging, { enabled: false, includeText: false, path: "logs/custom.log" });
+	for (const invalid of [NaN, Infinity, -Infinity, 0, -1, "120"]) {
+		const parsed = parseConfig({ timeoutMs: invalid, planTimeoutMs: invalid });
+		assert.equal(parsed.timeoutMs, 3000);
+		assert.equal(parsed.planTimeoutMs, 3000);
+	}
+	for (const invalid of [NaN, Infinity, -Infinity, -0.1, 1.1, "0.5"]) {
+		const parsed = parseConfig({ minConfidence: invalid, planMinConfidence: invalid });
+		assert.equal(parsed.minConfidence, 0.7);
+		assert.equal(parsed.planMinConfidence, 0.6);
+	}
+	assert.equal(parseConfig({ timeoutMs: 80 }).planTimeoutMs, 80, "omitted plan base preserves the smaller legacy timeout");
+	assert.equal(parseConfig({ timeoutMs: 6000 }).planTimeoutMs, 3000);
+	assert.equal(parseConfig({ timeoutMs: 80, planTimeoutMs: "bad" }).planTimeoutMs, 80);
+	assert.equal(parseConfig({ timeoutMs: 20_000, planTimeoutMs: 20_000 }).planTimeoutMs, TIMEOUT_CAP_MS);
+	for (const threshold of [0, 1]) {
+		const parsed = parseConfig({ minConfidence: threshold, planMinConfidence: threshold });
+		assert.equal(parsed.minConfidence, threshold);
+		assert.equal(parsed.planMinConfidence, threshold);
+	}
+	assert.deepEqual(
+		parseConfig({ enabled: "false", tierEnabled: 0, planEnabled: null }),
+		DEFAULT_CONFIG,
+		"wrong-type toggles do not override defaults",
+	);
+
+	const quick = harness({ choice: "quick", config: { tierModels: { quick: "@default" } } });
+	assert.equal((await route(quick))?.model, "@default", "a named, unpinned quick spawn returns the configured selector");
+	const heavy = harness({ choice: "heavy", config: { tierModels: { quick: "@default" } } });
+	assert.equal((await route(heavy))?.model, "@slow", "partial overrides retain other tier defaults");
+	const selectors = { heavy: "test/heavy", medium: "@smol", quick: "test/quick" };
+	for (const tier of ["heavy", "medium", "quick"] as const) {
+		const h = harness({ choice: tier, config: { tierModels: selectors } });
+		assert.equal((await route(h))?.model, selectors[tier]);
+		assert.equal(h.calls.length, 1);
+	}
+	const batch = harness({
+		config: { tierModels: selectors },
+		perQuestion: {
+			model_tier_0: { choice: "heavy", confidence: 0.9 },
+			model_tier_1: { choice: "medium", confidence: 0.9 },
+			model_tier_2: { choice: "quick", confidence: 0.9 },
+		},
+	});
+	const names = ["CustomHeavy", "CustomMedium", "CustomQuick"];
+	batch.handlers.tool_call({ toolName: "task", input: { tasks: names.map((name) => ({ name, task: `Summarize src/${name}.ts` })) } }, batch.context);
+	const routed = await Promise.all(names.map(async (spawnKey) => await batch.handlers.before_subagent_spawn({ ...baseEvent, modelRole: "task", spawnKey }, batch.context) as Routed));
+	assert.deepEqual(routed.map((result) => result?.model), [selectors.heavy, selectors.medium, selectors.quick]);
+	assert.equal(batch.calls.length, 1, "custom selectors preserve the single batched judgment");
+	const invalid = harness({ choice: "quick", config: { tierModels: { quick: "", heavy: false }, logging: [] } });
+	assert.equal((await route(invalid))?.model, "@smol");
+
+	for (const confidence of [0.799, 0.8]) {
+		const tier = harness({ choice: "quick", confidence, config: { minConfidence: 0.8 } });
+		assert.equal((await route(tier))?.model, confidence < 0.8 ? undefined : "@smol", "custom tier confidence applies at the boundary");
+		const plan = harness({ choice: "plan", confidence, config: { planMinConfidence: 0.8 } });
+		assert.equal((await message(plan))?.text, confidence < 0.8 ? undefined : `/plan ${featureText}`, "custom plan confidence switches at the boundary");
+	}
+	console.log("PASS configuration: validation, fresh defaults, custom single/batch selectors, custom confidence boundaries");
+}
+
+async function runFeatureGateChecks(): Promise<void> {
+	const planOnly = harness({ config: { tierEnabled: false, planEnabled: true }, choice: "plan" });
+	assert.equal(await route(planOnly), undefined);
+	assert.equal(planOnly.calls.length, 0);
+	assert.equal((await message(planOnly))?.text, `/plan ${featureText}`);
+	assert.equal(planOnly.calls.length, 1);
+	const tierOnly = harness({ config: { tierEnabled: true, planEnabled: false }, choice: "quick" });
+	assert.equal(await message(tierOnly), undefined);
+	assert.equal(tierOnly.calls.length, 0);
+	assert.equal((await route(tierOnly))?.model, "@smol");
+	const masterOff = harness({ config: { enabled: false }, choice: "quick" });
+	assert.equal(await route(masterOff), undefined);
+	assert.equal(await message(masterOff), undefined);
+	assert.equal(masterOff.calls.length, 0);
+	const hostOff = await sendMessage(featureText, { planAvailable: false, choice: "plan" });
+	assert.equal(hostOff.result, undefined);
+	assert.equal(hostOff.calls.length, 0);
+	for (const synonym of ["off", "0", "false", "no", "disabled", "disable", " OFF "]) {
+		await withEnv({ JEV_TIER: synonym, JEV_PLAN: "on" }, async () => {
+			const h = harness({ choice: "quick" });
+			assert.equal(await route(h), undefined);
+			assert.equal(await message(h), undefined);
+			assert.equal(h.calls.length, 0, `master env disable wins: ${synonym}`);
+		});
+		await withEnv({ JEV_PLAN: synonym }, async () => {
+			const h = harness({ choice: "quick" });
+			assert.equal(await message(h), undefined);
+			assert.equal((await route(h))?.model, "@smol", `plan-only env disable preserves tiering: ${synonym}`);
+			assert.equal(h.calls.length, 1);
+		});
+	}
+	assert.equal(isOff({ JEV_TIER: "on" }, parseConfig({ enabled: false })), true, "env is disable-only");
+	assert.equal(isPlanOff({ JEV_PLAN: "on" }, parseConfig({ planEnabled: false })), true);
+	await withEnv({ JEV_TIER: "on", JEV_PLAN: "on" }, async () => {
+		const h = harness({ config: { enabled: false }, choice: "quick" });
+		assert.equal(await route(h), undefined);
+		assert.equal(await message(h), undefined);
+		assert.equal(h.calls.length, 0);
+	});
+	console.log("PASS gates: independent features, master switch, host plan gate, environment disable-only precedence");
+}
+
+async function runConfiguredTimeoutChecks(): Promise<void> {
+	const h = harness({
+		config: { timeoutMs: 250, planTimeoutMs: 25 },
+		delayMs: 100,
+		perQuestion: { plan_route: { choice: "plan", confidence: 0.9 }, model_tier: { choice: "quick", confidence: 0.9 } },
+	});
+	const start = Date.now();
+	assert.equal(await message(h), undefined, "small explicit plan base fails open even when the judge ignores abort");
+	assert.ok(Date.now() - start < 1000);
+	assert.equal(h.calls[0].signal.aborted, true, "the timed-out plan request is aborted");
+	assert.equal((await route(h))?.model, "@smol", "the plan base must not shorten the spawn base");
+	assert.equal(h.calls[1].signal.aborted, false);
+	assert.deepEqual(h.notices, []);
+	const hungCalls: JudgeRequest[] = [];
+	const hung = harness({
+		config: { timeoutMs: 30, planTimeoutMs: 15 },
+		judgeFn: (request) => {
+			hungCalls.push(request);
+			return Promise.withResolvers<never>().promise;
+		},
+	});
+	assert.equal(await message(hung), undefined);
+	assert.equal(await route(hung), undefined);
+	assert.equal(hungCalls.length, 2);
+	assert.ok(hungCalls.every((request) => request.signal.aborted), "both configured waits settle and abort an uncooperative judge");
+	const legacy = harness({ config: { timeoutMs: 20 }, choice: "plan", delayMs: 60 });
+	assert.equal(await message(legacy), undefined, "omitted plan base uses the parsed smaller spawn base");
+	assert.equal(legacy.calls[0].signal.aborted, true);
+	const capped = parseConfig({ timeoutMs: 50_000, planTimeoutMs: 50_000 });
+	assert.equal(spawnTimeoutMs(capped.timeoutMs, 50_000), TIMEOUT_CAP_MS);
+	assert.equal(planTimeoutMs(capped.planTimeoutMs, 50_000), TIMEOUT_CAP_MS);
+	const cappedRequests: JudgeRequest[] = [];
+	const cappedHooks = harness({
+		config: { timeoutMs: 50_000, planTimeoutMs: 50_000, logging: { includeText: true } },
+		judgeFn: (request) => {
+			cappedRequests.push(request);
+			return Promise.withResolvers<never>().promise;
+		},
+	});
+	const capStart = Date.now();
+	assert.deepEqual(await Promise.all([message(cappedHooks), route(cappedHooks)]), [undefined, undefined], "both oversized bases fail open at the hard cap");
+	assert.ok(Date.now() - capStart < 11_000, "neither configured base can wait for the requested 50 seconds");
+	assert.equal(cappedRequests.length, 2);
+	assert.ok(cappedRequests.every((request) => request.signal.aborted));
+	const cappedLog = readFileSync(cappedHooks.logFile, "utf8");
+	assert.equal(cappedLog.split("timeout after 8000ms").length - 1, 2, "both actual hooks enforce the fixed 8-second cap");
+	console.log("PASS configured timeouts: independent bases, abort-ignoring fail-open, legacy fallback, capped scaling");
+}
+
+async function runPrivacyChecks(): Promise<void> {
+	const distinctive = "distinctive private task wording";
+	const metadata = harness({
+		perQuestion: { model_tier: { choice: "quick", confidence: 0.9 }, plan_route: { choice: "plan", confidence: 0.9 } },
+	});
+	assert.equal((await route(metadata, "MetadataTask", distinctive))?.model, "@smol");
+	assert.equal((await message(metadata, `${distinctive} across src/a.ts and src/b.ts`))?.text?.startsWith("/plan "), true);
+	const lines = readFileSync(metadata.logFile, "utf8");
+	assert.match(lines, /tier=quick/);
+	assert.match(lines, /verdict=plan/);
+	assert.match(lines, /action=applied/);
+	assert.match(lines, /action=switched/);
+	assert.doesNotMatch(lines, /(?:task|msg)=/);
+	assert.ok(!lines.includes(distinctive));
+	assert.equal(statSync(metadata.logFile).mode & 0o777, 0o600, "new logs are private");
+	const error = harness({ fail: true, errorMessage: `service echoed ${distinctive} API_KEY=secret-value-1234567890` });
+	await route(error, "ErrorTask", distinctive);
+	await message(error, distinctive);
+	const errorLog = readFileSync(error.logFile, "utf8");
+	assert.equal(errorLog.split('reason="jev error"').length - 1, 2);
+	assert.ok(!errorLog.includes(distinctive));
+	assert.ok(!errorLog.includes("secret-value-1234567890"));
+	assert.doesNotMatch(errorLog, /(?:task|msg)=/);
+
+	const optIn = harness({
+		config: { logging: { includeText: true } },
+		perQuestion: { model_tier: { choice: "quick", confidence: 0.9 }, plan_route: { choice: "plan", confidence: 0.9 } },
+	});
+	await route(optIn, "OptInTask", `${distinctive} API_KEY=secret-value-1234567890`);
+	await message(optIn, `${distinctive} API_KEY=secret-value-1234567890 across src/a.ts and src/b.ts`);
+	const textLog = readFileSync(optIn.logFile, "utf8");
+	assert.match(textLog, /task=/);
+	assert.match(textLog, /msg=/);
+	assert.ok(textLog.includes(distinctive));
+	assert.ok(textLog.includes("[redacted]"));
+	assert.ok(!textLog.includes("secret-value-1234567890"));
+	const detailedError = harness({
+		fail: true,
+		errorMessage: `service echoed ${distinctive} API_KEY=secret-value-1234567890`,
+		config: { logging: { includeText: true } },
+	});
+	await route(detailedError, "DetailedError", distinctive);
+	await message(detailedError, distinctive);
+	const details = readFileSync(detailedError.logFile, "utf8");
+	assert.ok(details.includes(`jev error: service echoed ${distinctive}`));
+	assert.ok(details.includes("[redacted]"));
+	assert.ok(!details.includes("secret-value-1234567890"));
+
+	const off = harness({
+		useDefaultLog: true,
+		config: { tierModels: { quick: "@default" }, logging: { enabled: false } },
+		perQuestion: { model_tier: { choice: "quick", confidence: 0.9 }, plan_route: { choice: "plan", confidence: 0.9 } },
+	});
+	assert.equal((await route(off))?.model, "@default");
+	assert.equal((await message(off))?.text, `/plan ${featureText}`);
+	assert.equal(existsSync(off.logFile), false);
+	assert.equal(existsSync(dirname(off.logFile)), false, "disabled logging creates no directory");
+	const overrideOff = harness({ config: { logging: { enabled: false, path: "never-created/custom.log" } }, choice: "quick" });
+	assert.equal((await route(overrideOff))?.model, "@smol");
+	assert.equal(existsSync(dirname(overrideOff.logFile)), false, "disabled logging also suppresses dependency overrides");
+	assert.equal(existsSync(join(dirname(overrideOff.configPath), "never-created")), false);
+
+	const identifiers = harness({ choice: "quick", config: { tierModels: { quick: "test/model\ninjected" } } });
+	identifiers.handlers.tool_call({ toolName: "task", input: { tasks: [{ name: "Quoted\nTask", task: "Summarize src/a.ts" }] } }, identifiers.context);
+	await identifiers.handlers.before_subagent_spawn({ ...baseEvent, spawnKey: "Quoted\nTask", agent: "agent\ninjected" }, identifiers.context);
+	const identifierLog = readFileSync(identifiers.logFile, "utf8");
+	assert.equal(identifierLog.trimEnd().split("\n").length, 1, "free-text identifiers cannot inject log lines");
+	assert.ok(identifierLog.includes(JSON.stringify("Quoted\nTask")));
+	assert.ok(identifierLog.includes(JSON.stringify("agent\ninjected")));
+	assert.ok(identifierLog.includes(JSON.stringify("test/model\ninjected")));
+
+	const existing = harness({ choice: "quick" });
+	mkdirSync(dirname(existing.logFile), { recursive: true });
+	writeFileSync(existing.logFile, "existing\n", { mode: 0o644 });
+	const priorMode = statSync(existing.logFile).mode & 0o777;
+	await route(existing);
+	assert.equal(statSync(existing.logFile).mode & 0o777, priorMode, "existing user log permissions are not changed");
+	assert.ok(readFileSync(existing.logFile, "utf8").startsWith("existing\n"), "logging remains append-only");
+	const brokenLog = harness({ choice: "quick" });
+	mkdirSync(brokenLog.logFile, { recursive: true });
+	assert.equal((await route(brokenLog))?.model, "@smol", "log write failures cannot break routing");
+	console.log("PASS logging: metadata privacy, opt-in heuristic redaction, disabled side effects, private append, safe identifiers, fail-silent errors");
+}
+
+async function runConfigFileChecks(): Promise<void> {
+	const missingDefault = harness({ choice: "quick", useDefaultConfig: true, useDefaultLog: true });
+	assert.equal(existsSync(missingDefault.configPath), false);
+	assert.equal((await route(missingDefault))?.model, "@smol");
+	assert.deepEqual(missingDefault.notices, []);
+	assert.equal(existsSync(missingDefault.configPath), false, "defaults never create the user's config");
+	const failures = ["missing", "malformed", "unreadable", "array", "null", "primitive"] as const;
+	for (const kind of failures) {
+		const h = harness({
+			perQuestion: { model_tier: { choice: "quick", confidence: 0.9 }, plan_route: { choice: "plan", confidence: 0.9 } },
+		});
+		if (kind === "missing") rmSync(h.configPath);
+		else if (kind === "unreadable") {
+			rmSync(h.configPath);
+			mkdirSync(h.configPath); // deterministic EISDIR even when the suite is run as root
+		} else writeFileSync(h.configPath, kind === "malformed" ? '{"credential":"never expose me"' : kind === "array" ? "[]" : kind === "null" ? "null" : '"primitive"');
+		assert.equal(await route(h), undefined, kind);
+		assert.equal(await message(h), undefined, kind);
+		assert.equal(await route(h), undefined, kind);
+		assert.equal(h.calls.length, 0, `${kind} configuration must not make a judge request`);
+		assert.deepEqual(h.notices, [configWarning], "one sanitized warning for a failure period across hooks");
+		assert.equal(existsSync(h.logFile), false);
+		if (kind === "unreadable") rmSync(h.configPath, { recursive: true });
+		rewriteConfig(h, { tierModels: { quick: "@default" } });
+		assert.equal((await route(h))?.model, "@default", "valid rewrite recovers without re-registering");
+		assert.equal((await message(h))?.text, `/plan ${featureText}`);
+		assert.equal(h.calls.length, 2);
+		writeFileSync(h.configPath, "{");
+		assert.equal(await message(h), undefined);
+		assert.equal(await route(h), undefined);
+		assert.deepEqual(h.notices.filter((notice) => notice === configWarning), [configWarning, configWarning], "recovery resets warning suppression");
+	}
+	const live = harness({ choice: "quick" });
+	assert.equal((await route(live))?.model, "@smol");
+	rewriteConfig(live, { tierModels: { quick: "@default" } });
+	assert.equal((await route(live))?.model, "@default", "partial config is reread on the next hook");
+	rewriteConfig(live, { tierEnabled: false, planEnabled: true });
+	assert.equal(await route(live), undefined);
+	assert.equal((await message(live, "Make a plan to implement configurable routing"))?.text, "/plan Make a plan to implement configurable routing");
+	rewriteConfig(live, { enabled: false });
+	assert.equal(await message(live), undefined);
+	rewriteConfig(live, { planEnabled: false });
+	assert.equal((await route(live))?.model, "@smol");
+	assert.equal(await message(live), undefined);
+	const defaultRecovery = harness({ useDefaultConfig: true, choice: "quick", config: {} });
+	writeFileSync(defaultRecovery.configPath, "{");
+	assert.equal(await route(defaultRecovery), undefined);
+	rmSync(defaultRecovery.configPath);
+	assert.equal((await route(defaultRecovery))?.model, "@smol", "a missing default config ends the failure period");
+	rewriteConfig(defaultRecovery, []);
+	assert.equal(await route(defaultRecovery), undefined);
+	assert.deepEqual(defaultRecovery.notices, [configWarning, configWarning]);
+	const notifyFailure = harness({ choice: "quick" });
+	rmSync(notifyFailure.configPath);
+	let noticeAttempts = 0;
+	notifyFailure.context.ui = { notify: () => { noticeAttempts++; throw new Error("UI failed"); } };
+	assert.equal(await route(notifyFailure), undefined);
+	assert.equal(await message(notifyFailure), undefined);
+	assert.equal(noticeAttempts, 1, "notification errors are caught and suppressed for the failure period");
+	rewriteConfig(notifyFailure, {});
+	assert.equal((await route(notifyFailure))?.model, "@smol");
+	console.log("PASS configuration files: default absence, explicit/read/JSON/root failures, sanitized warning periods, reload recovery");
+}
+
+async function runPathChecks(): Promise<void> {
+	const first = harness({ useDefaultConfig: true, useDefaultLog: true, choice: "quick", config: { tierModels: { quick: "test/profile-one" } } });
+	const second = harness({ useDefaultConfig: true, useDefaultLog: true, choice: "quick", config: { tierModels: { quick: "test/profile-two" } } });
+	assert.equal((await route(first, "SharedName"))?.model, "test/profile-one");
+	assert.equal((await route(second, "SharedName"))?.model, "test/profile-two");
+	assert.ok(existsSync(join(first.agentDir, "logs", "jev-tier.log")));
+	assert.ok(existsSync(join(second.agentDir, "logs", "jev-tier.log")));
+	assert.equal(first.calls.length, 1);
+	assert.equal(second.calls.length, 1, "registrations own their task capture state");
+	const untouched = harness({ useDefaultConfig: true, choice: "quick" });
+	assert.equal(await untouched.handlers.before_subagent_spawn({ ...baseEvent, spawnKey: "SharedName" }, untouched.context), undefined, "another registration's captured tasks are not visible");
+	assert.equal(untouched.calls.length, 0);
+
+	const selected = join(testRoot, "environment", "selected.json");
+	mkdirSync(dirname(selected), { recursive: true });
+	writeFileSync(selected, JSON.stringify({ tierModels: { quick: "test/environment" } }));
+	await withEnv({ JEV_TIER_CONFIG: `  ${relative(process.cwd(), selected)}  ` }, async () => {
+		const env = harness({ useDefaultConfig: true, choice: "quick", config: { enabled: false } });
+		assert.equal((await route(env))?.model, "test/environment", "relative env override beats the profile file and resolves against startup cwd");
+		process.env.JEV_TIER_CONFIG = join(testRoot, "changed-after-startup.json");
+		assert.equal((await route(env))?.model, "test/environment", "config selection is resolved once per register instance");
+		const explicit = harness({ choice: "quick", config: { tierModels: { quick: "test/dependency" } } });
+		assert.equal((await route(explicit))?.model, "test/dependency", "dependency config selection beats the env override");
+		const missingEnv = harness({ useDefaultConfig: true, choice: "quick" });
+		assert.equal(await route(missingEnv), undefined, "missing explicitly selected env config fails closed");
+		assert.deepEqual(missingEnv.notices, [configWarning]);
+	});
+	await withEnv({ JEV_TIER_CONFIG: "   " }, async () => {
+		const blank = harness({ useDefaultConfig: true, choice: "quick" });
+		assert.equal((await route(blank))?.model, "@smol", "blank env selection retains the missing-default behavior");
+	});
+	const relativeFile = join(testRoot, "relative-dependency", "config.json");
+	const relativeConfig = harness({ choice: "quick", configPath: relative(process.cwd(), relativeFile), config: { tierModels: { quick: "test/relative" } } });
+	assert.equal((await route(relativeConfig))?.model, "test/relative", "relative dependency config resolves against startup cwd");
+	const tildeFile = join(testRoot, "tilde-dependency", "config.json");
+	const tildeSelector = `~/${relative(homedir(), tildeFile)}`;
+	const tildeConfig = harness({ choice: "quick", configPath: tildeSelector, config: { tierModels: { quick: "test/tilde" } } });
+	assert.equal((await route(tildeConfig))?.model, "test/tilde", "leading tilde config selection is expanded without shell evaluation");
+	const custom = harness({ useDefaultLog: true, choice: "quick", config: { logging: { path: "nested/custom.log" } } });
+	assert.equal((await route(custom))?.model, "@smol");
+	const firstLog = join(dirname(custom.configPath), "nested", "custom.log");
+	assert.ok(existsSync(firstLog), "configured relative logfile is rooted at the selected config directory");
+	assert.equal(existsSync(custom.logFile), false);
+	rewriteConfig(custom, { tierModels: { quick: "@default" }, logging: { path: "other/live.log", includeText: true } });
+	assert.equal((await route(custom, "LiveLog", "ordinary excerpt text"))?.model, "@default");
+	const secondLog = join(dirname(custom.configPath), "other", "live.log");
+	assert.match(readFileSync(secondLog, "utf8"), /task="ordinary excerpt text"/);
+	rewriteConfig(custom, { logging: { enabled: false, path: "disabled/no.log" } });
+	assert.equal((await route(custom))?.model, "@smol");
+	assert.equal(existsSync(join(dirname(custom.configPath), "disabled")), false);
+	const precedence = harness({ choice: "quick", config: { logging: { path: "ignored/custom.log" } } });
+	await route(precedence);
+	assert.ok(existsSync(precedence.logFile), "dependency logfile beats configured logfile");
+	assert.equal(existsSync(join(dirname(precedence.configPath), "ignored")), false);
+	const tildeLogFile = join(testRoot, "tilde-log", "custom.log");
+	const tildeLog = harness({ useDefaultLog: true, choice: "quick", config: { logging: { path: `~/${relative(homedir(), tildeLogFile)}` } } });
+	assert.equal((await route(tildeLog))?.model, "@smol");
+	assert.ok(existsSync(tildeLogFile));
+	const depLogFile = join(testRoot, "relative-log", "custom.log");
+	const depLog = harness({ choice: "quick", logPath: relative(process.cwd(), depLogFile) });
+	assert.equal((await route(depLog))?.model, "@smol");
+	assert.ok(existsSync(depLogFile), "relative dependency logfile resolves against startup cwd");
+	console.log("PASS paths: isolated profiles, dependency/env/default config precedence, startup cwd, tilde, log precedence and live settings");
+}
+
+try {
+	for (const key of envKeys) delete process.env[key];
+	await runTierChecks();
+	await runPinChecks();
+	await runTimeoutCheck();
+	await runTimeoutScalingChecks();
+	await runBatchChecks();
+	runKeywordChecks();
+	runExplicitPlanChecks();
+	await runPlanChecks();
+	await runSingleCallChecks();
+	await runConfigurationChecks();
+	await runFeatureGateChecks();
+	await runConfiguredTimeoutChecks();
+	await runPrivacyChecks();
+	await runConfigFileChecks();
+	await runPathChecks();
+	console.log("PASS all executable harness checks");
+} finally {
+	for (const key of envKeys) {
+		if (originalEnv[key] === undefined) delete process.env[key];
+		else process.env[key] = originalEnv[key];
+	}
+	rmSync(testRoot, { recursive: true, force: true });
+}

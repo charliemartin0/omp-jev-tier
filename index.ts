@@ -1,6 +1,7 @@
 // omp entry point. Kept thin: the omp-only imports live here so register.ts stays runnable under plain bun
 // for test.ts. Everything else is in register.ts / core.ts / plan.ts.
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
+import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { createNativeJudge } from "./judge";
 import { register, type ExtensionAPI } from "./register";
 
@@ -23,6 +24,7 @@ export default function (pi: OmpExtensionAPI): void {
 	const judge = createNativeJudge(pi.pi.settings);
 
 	register(pi, {
+		agentDir: getAgentDir(),
 		// `/plan` swallows the message with a warning when plan.enabled is false, so anything other than an
 		// explicit `true` (including a missing registry handle) means "do not rewrite to /plan".
 		planModeAvailable: () => planEnabled?.get(pi.pi.settings) === true,

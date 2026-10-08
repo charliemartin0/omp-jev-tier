@@ -1,6 +1,6 @@
 // Automatic plan-mode detection for the jev-tier extension. Pure logic, no omp imports.
 
-import { DEFAULT_CONFIG, askChoice, extractPaths, redact, rubric, scaledTimeoutMs, summarize, type ChoiceQuestion, type Config, type JudgeFn } from "./core";
+import { askChoice, extractPaths, redact, rubric, scaledTimeoutMs, summarize, type ChoiceQuestion, type Config, type JudgeFn } from "./core";
 
 export type PlanVerdict = "plan" | "direct";
 
@@ -210,8 +210,7 @@ export async function decidePlan(input: PlanDecideInput): Promise<PlanDecision> 
 			question: planQuestion(),
 			choices: PLAN_VERDICTS,
 			purpose: "jev-tier:plan_route",
-			// The config may raise `timeoutMs` for spawn tiering; plan routing keeps its 3s base, as before that was allowed.
-			timeoutMs: planTimeoutMs(Math.min(config.timeoutMs, DEFAULT_CONFIG.timeoutMs), sent.length),
+			timeoutMs: planTimeoutMs(config.planTimeoutMs, sent.length),
 		});
 	} catch (error) {
 		const msg = redact(error instanceof Error ? error.message : String(error), secrets).slice(0, 120);
@@ -225,14 +224,16 @@ export async function decidePlan(input: PlanDecideInput): Promise<PlanDecision> 
 	return { action: "switch", verdict: "plan", confidence, reason: planReason(signals), summary };
 }
 
-export function formatPlanLog(decision: PlanDecision, now = new Date()): string {
-	return [
+export function formatPlanLog(decision: PlanDecision, now = new Date(), includeText = false): string {
+	const reason = !includeText && decision.reason.startsWith("jev error:") ? "jev error" : decision.reason;
+	const parts = [
 		now.toISOString(),
 		"kind=plan",
 		`verdict=${decision.verdict ?? "-"}`,
 		`conf=${decision.confidence ?? "-"}`,
 		`action=${decision.action === "switch" ? "switched" : "skipped"}`,
-		`reason=${JSON.stringify(decision.reason)}`,
-		`msg=${JSON.stringify(decision.summary)}`,
-	].join(" ");
+		`reason=${JSON.stringify(reason)}`,
+	];
+	if (includeText) parts.push(`msg=${JSON.stringify(decision.summary)}`);
+	return parts.join(" ");
 }

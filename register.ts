@@ -1,8 +1,7 @@
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
-	DEFAULT_CONFIG,
 	TaskIndex,
 	decide,
 	formatLog,
@@ -36,13 +35,17 @@ export interface ExtensionAPI {
 	on(event: string, handler: (event: unknown, context: ExtensionContext) => unknown): void;
 }
 export interface Dependencies {
+	/** omp's native, profile-aware agent directory. */
+	agentDir: string;
+	/** Explicit config selection, ahead of JEV_TIER_CONFIG and the profile default. */
+	configPath?: string;
 	/** True when omp's `plan.enabled` setting allows /plan. */
 	planModeAvailable(): boolean;
 	/** True when omp would act on this magic keyword (`magicKeywords.enabled` and the keyword's own switch). */
 	magicKeywordActive(keyword: string): boolean;
 	/** Runs one judgment through omp's native judge for this session; throws when Jev is unavailable. */
 	judge(context: ExtensionContext, request: JudgeRequest): Promise<unknown>;
-	/** Defaults to ~/.omp/agent/logs/jev-tier.log; tests redirect it. */
+	/** Explicit log selection, ahead of configuration and the profile default. */
 	logPath?: string;
 }
 interface ToolCallEvent {
@@ -54,18 +57,45 @@ interface InputEvent {
 	source?: string;
 }
 
-const agentDir = join(homedir(), ".omp", "agent");
-const configPath = join(agentDir, "extensions", "jev-tier", "config.json");
-const defaultLogPath = join(agentDir, "logs", "jev-tier.log");
-const tasks = new TaskIndex();
 const NOTICE_DELAY_MS = 400;
+const CONFIG_WARNING = "jev-tier: cannot read configuration; routing disabled until fixed";
 
-function readConfig(): Config {
-	try {
-		return parseConfig(JSON.parse(readFileSync(configPath, "utf8")) as unknown);
-	} catch {
-		return { ...DEFAULT_CONFIG };
-	}
+function resolvePath(path: string, base: string): string {
+	const expanded = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+	return resolve(base, expanded);
+}
+
+function createConfigReader(configPath: string, explicitlySelected: boolean): (context: ExtensionContext) => Config {
+	let warned = false;
+	return (context) => {
+		try {
+			let text: string;
+			try {
+				text = readFileSync(configPath, "utf8");
+			} catch (error) {
+				if (!explicitlySelected && error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+					warned = false;
+					return parseConfig(undefined);
+				}
+				throw error;
+			}
+			const raw: unknown = JSON.parse(text);
+			if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid configuration root");
+			const config = parseConfig(raw);
+			warned = false;
+			return config;
+		} catch {
+			if (!warned && context.ui?.notify) {
+				warned = true;
+				try {
+					context.ui.notify(CONFIG_WARNING, "warning");
+				} catch {
+					// A UI failure cannot hold a spawn or message.
+				}
+			}
+			return { ...parseConfig(undefined), enabled: false };
+		}
+	};
 }
 
 function currentModel(context: ExtensionContext): string | undefined {
@@ -89,8 +119,18 @@ function readSession(context: ExtensionContext): SessionView | undefined {
 }
 
 export function register(pi: ExtensionAPI, deps: Dependencies): void {
-	const logPath = deps.logPath ?? defaultLogPath;
-	const logDecision = (line: string): void => {
+	const cwd = process.cwd();
+	const agentDir = resolvePath(deps.agentDir, cwd);
+	const override = deps.configPath ?? (process.env.JEV_TIER_CONFIG?.trim() || undefined);
+	const configPath = override === undefined ? join(agentDir, "extensions", "jev-tier", "config.json") : resolvePath(override, cwd);
+	const readConfig = createConfigReader(configPath, override !== undefined);
+	const tasks = new TaskIndex();
+	const logDecision = (config: Config, line: string): void => {
+		const logPath = deps.logPath !== undefined
+			? resolvePath(deps.logPath, cwd)
+			: config.logging.path !== undefined
+				? resolvePath(config.logging.path, dirname(configPath))
+				: join(agentDir, "logs", "jev-tier.log");
 		try {
 			mkdirSync(dirname(logPath), { recursive: true });
 			appendFileSync(logPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
@@ -106,8 +146,8 @@ export function register(pi: ExtensionAPI, deps: Dependencies): void {
 
 	pi.on("before_subagent_spawn", async (rawEvent, context) => {
 		const event = rawEvent as SpawnEvent;
-		const config = readConfig();
-		if (isOff(process.env, config)) return;
+		const config = readConfig(context);
+		if (isOff(process.env, config) || !config.tierEnabled) return;
 
 		const pending = tasks.take(event.spawnKey);
 		const decision = await decide({
@@ -117,7 +157,7 @@ export function register(pi: ExtensionAPI, deps: Dependencies): void {
 			config,
 			judge: (request) => deps.judge(context, request),
 		});
-		logDecision(formatLog(decision, event));
+		if (config.logging.enabled) logDecision(config, formatLog(decision, event, new Date(), config.logging.includeText));
 		if (decision.action === "apply") return { model: decision.model, note: decision.note };
 		return;
 	});
@@ -129,7 +169,7 @@ export function register(pi: ExtensionAPI, deps: Dependencies): void {
 	pi.on("input", async (rawEvent, context) => {
 		try {
 			const event = rawEvent as InputEvent;
-			const config = readConfig();
+			const config = readConfig(context);
 			if (isOff(process.env, config) || isPlanOff(process.env, config)) return;
 			if (context.agent?.kind === "sub" || typeof event.text !== "string") return;
 
@@ -144,7 +184,7 @@ export function register(pi: ExtensionAPI, deps: Dependencies): void {
 				config,
 				judge: (request) => deps.judge(context, request),
 			});
-			logDecision(formatPlanLog(decision));
+			if (config.logging.enabled) logDecision(config, formatPlanLog(decision, new Date(), config.logging.includeText));
 			if (decision.action !== "switch") return;
 			// /plan writes its own "Plan mode enabled" status line in the same tick, and omp overwrites a trailing
 			// status line, so emit ours just after it (managed timer: a throw cannot take the session down).

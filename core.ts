@@ -4,25 +4,31 @@ export type Tier = "heavy" | "medium" | "quick";
 
 export const TIERS: readonly Tier[] = ["heavy", "medium", "quick"];
 
-// heavy = slow role, medium = default role, quick = smol role. Role aliases resolve through the
-// user's own modelRoles and fallback chains; nothing here names a concrete model.
-export const TIER_MODEL: Record<Tier, string> = {
-	heavy: "@slow",
-	medium: "@default",
-	quick: "@smol",
-};
-
-
 export interface Config {
 	enabled: boolean;
+	tierEnabled: boolean;
+	tierModels: Record<Tier, string>;
 	timeoutMs: number;
+	planTimeoutMs: number;
 	minConfidence: number;
 	/** Automatic plan-mode detection (JEV_PLAN / `planEnabled`). */
 	planEnabled: boolean;
 	planMinConfidence: number;
+	logging: { enabled: boolean; includeText: boolean; path?: string };
 }
 
-export const DEFAULT_CONFIG: Config = { enabled: true, timeoutMs: 3000, minConfidence: 0.7, planEnabled: true, planMinConfidence: 0.6 };
+export const DEFAULT_CONFIG: Config = {
+	enabled: true,
+	tierEnabled: true,
+	// omp resolves these selectors through the user's own model roles and fallback chains.
+	tierModels: { heavy: "@slow", medium: "@default", quick: "@smol" },
+	timeoutMs: 3000,
+	planTimeoutMs: 3000,
+	minConfidence: 0.7,
+	planEnabled: true,
+	planMinConfidence: 0.6,
+	logging: { enabled: true, includeText: false },
+};
 
 /** Hard cap on any Jev wait: config and length scaling both stop here. */
 export const TIMEOUT_CAP_MS = 8000;
@@ -124,14 +130,34 @@ export function isOff(env: Record<string, string | undefined>, config: Config): 
 }
 
 export function parseConfig(raw: unknown): Config {
-	const out = { ...DEFAULT_CONFIG };
-	if (!raw || typeof raw !== "object") return out;
+	const out: Config = {
+		...DEFAULT_CONFIG,
+		tierModels: { ...DEFAULT_CONFIG.tierModels },
+		logging: { ...DEFAULT_CONFIG.logging },
+	};
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
 	const r = raw as Record<string, unknown>;
 	if (typeof r.enabled === "boolean") out.enabled = r.enabled;
-	if (typeof r.timeoutMs === "number" && r.timeoutMs > 0) out.timeoutMs = Math.min(r.timeoutMs, TIMEOUT_CAP_MS);
-	if (typeof r.minConfidence === "number" && r.minConfidence >= 0 && r.minConfidence <= 1) out.minConfidence = r.minConfidence;
+	if (typeof r.tierEnabled === "boolean") out.tierEnabled = r.tierEnabled;
+	if (typeof r.timeoutMs === "number" && Number.isFinite(r.timeoutMs) && r.timeoutMs > 0) out.timeoutMs = Math.min(r.timeoutMs, TIMEOUT_CAP_MS);
+	out.planTimeoutMs = Math.min(out.timeoutMs, DEFAULT_CONFIG.planTimeoutMs);
+	if (typeof r.planTimeoutMs === "number" && Number.isFinite(r.planTimeoutMs) && r.planTimeoutMs > 0) out.planTimeoutMs = Math.min(r.planTimeoutMs, TIMEOUT_CAP_MS);
+	if (typeof r.minConfidence === "number" && Number.isFinite(r.minConfidence) && r.minConfidence >= 0 && r.minConfidence <= 1) out.minConfidence = r.minConfidence;
 	if (typeof r.planEnabled === "boolean") out.planEnabled = r.planEnabled;
-	if (typeof r.planMinConfidence === "number" && r.planMinConfidence >= 0 && r.planMinConfidence <= 1) out.planMinConfidence = r.planMinConfidence;
+	if (typeof r.planMinConfidence === "number" && Number.isFinite(r.planMinConfidence) && r.planMinConfidence >= 0 && r.planMinConfidence <= 1) out.planMinConfidence = r.planMinConfidence;
+	if (r.tierModels && typeof r.tierModels === "object" && !Array.isArray(r.tierModels)) {
+		const models = r.tierModels as Record<string, unknown>;
+		for (const tier of TIERS) {
+			const selector = models[tier];
+			if (typeof selector === "string" && selector.trim()) out.tierModels[tier] = selector.trim();
+		}
+	}
+	if (r.logging && typeof r.logging === "object" && !Array.isArray(r.logging)) {
+		const logging = r.logging as Record<string, unknown>;
+		if (typeof logging.enabled === "boolean") out.logging.enabled = logging.enabled;
+		if (typeof logging.includeText === "boolean") out.logging.includeText = logging.includeText;
+		if (typeof logging.path === "string" && logging.path.trim()) out.logging.path = logging.path.trim();
+	}
 	return out;
 }
 
@@ -504,19 +530,21 @@ export async function decide(input: DecideInput): Promise<Decision> {
 	}
 
 	const tier = answer.choice;
-	return { action: "apply", tier, confidence: conf, model: TIER_MODEL[tier], note: `jev-tier: ${tier} (${conf})`, reason, summary };
+	return { action: "apply", tier, confidence: conf, model: config.tierModels[tier], note: `jev-tier: ${tier} (${conf})`, reason, summary };
 }
 
-export function formatLog(decision: Decision, event: SpawnEvent, now = new Date()): string {
+export function formatLog(decision: Decision, event: SpawnEvent, now = new Date(), includeText = false): string {
 	const parts = [
 		now.toISOString(),
-		`spawn=${event.spawnKey ?? "-"}`,
-		`agent=${event.agent ?? "-"}`,
+		`spawn=${JSON.stringify(event.spawnKey ?? "-")}`,
+		`agent=${JSON.stringify(event.agent ?? "-")}`,
 		`tier=${decision.tier ?? "-"}`,
 		`conf=${decision.confidence ?? "-"}`,
 		`action=${decision.action === "apply" ? "applied" : "skipped"}`,
 	];
-	if (decision.action === "apply") parts.push(`model=${decision.model}`);
-	parts.push(`reason=${JSON.stringify(decision.reason)}`, `task=${JSON.stringify(decision.summary)}`);
+	if (decision.action === "apply") parts.push(`model=${JSON.stringify(decision.model)}`);
+	const reason = !includeText && decision.reason.startsWith("jev error:") ? "jev error" : decision.reason;
+	parts.push(`reason=${JSON.stringify(reason)}`);
+	if (includeText) parts.push(`task=${JSON.stringify(decision.summary)}`);
 	return parts.join(" ");
 }
