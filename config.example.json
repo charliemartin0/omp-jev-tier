@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "tierEnabled": true,
+  "planEnabled": true,
+  "tierModels": {
+    "heavy": "@slow",
+    "medium": "@default",
+    "quick": "@smol"
+  },
+  "timeoutMs": 3000,
+  "planTimeoutMs": 3000,
+  "minConfidence": 0.7,
+  "planMinConfidence": 0.6,
+  "logging": {
+    "enabled": true,
+    "includeText": false
+  }
+}
