@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, TaskIndex, askChoice, decide, explicitReason, formatLog, type JudgeFn, type JudgeRequest, type SpawnEvent } from "./core";
+import { DEFAULT_CONFIG, TIMEOUT_CAP_MS, TaskIndex, askChoice, decide, explicitReason, formatLog, parseConfig, spawnTimeoutMs, type JudgeFn, type JudgeRequest, type SpawnEvent } from "./core";
 import { explicitPlanRequest, findMagicKeyword, planTimeoutMs } from "./plan";
 import { register, type ExtensionContext } from "./register";
 
@@ -12,13 +12,17 @@ const baseEvent: SpawnEvent = { agent: "task", invocationKind: "task", patterns:
 const when = new Date("2026-10-06T00:00:00.000Z");
 
 // A scripted stand-in for omp's native judge. It enforces what the native cache and `judge()` normalizer need
-// (string instructions, string criteria, one choice question) and records every call.
+// (string instructions, string criteria, choice questions) and records every call.
 interface Script {
 	choice?: string;
 	confidence?: number;
 	fail?: boolean;
 	/** Resolve this many ms late; ignores the abort signal, like a slow network call. */
 	delayMs?: number;
+	/** Per question id answers, overriding `choice`/`confidence`. */
+	perQuestion?: Record<string, { choice: string; confidence: number }>;
+	/** Question ids left out of the answer, like an unusable response. */
+	omit?: string[];
 }
 
 function scripted(script: Script = {}) {
@@ -26,11 +30,13 @@ function scripted(script: Script = {}) {
 	const judge: JudgeFn = async (request) => {
 		calls.push(request);
 		const ids = Object.keys(request.questions);
-		assert.equal(ids.length, 1, "exactly one question per judgment");
-		const question = request.questions[ids[0]];
-		assert.equal(question.type, "choice");
-		assert.equal(typeof question.instructions, "string");
-		assert.ok(Object.values(question.criteria).every((label) => typeof label === "string" && label.length > 0), "criteria must be strings");
+		assert.ok(ids.length >= 1, "at least one question per judgment");
+		for (const id of ids) {
+			const question = request.questions[id];
+			assert.equal(question.type, "choice");
+			assert.equal(typeof question.instructions, "string");
+			assert.ok(Object.values(question.criteria).every((label) => typeof label === "string" && label.length > 0), "criteria must be strings");
+		}
 		assert.ok(request.purpose.startsWith("jev-tier:"));
 		if (script.fail) throw new Error("forced judge failure");
 		if (script.delayMs) {
@@ -38,8 +44,16 @@ function scripted(script: Script = {}) {
 			setTimeout(resolve, script.delayMs);
 			await promise;
 		}
-		const choice = script.choice ?? Object.keys(question.criteria)[0];
-		return { answers: { [ids[0]]: { type: "choice", choice, probabilities: { [choice]: script.confidence ?? 0.9 }, confidence: script.confidence ?? 0.9 } } };
+		const answers = Object.fromEntries(
+			ids
+				.filter((id) => !script.omit?.includes(id))
+				.map((id) => {
+					const choice = script.perQuestion?.[id]?.choice ?? script.choice ?? Object.keys(request.questions[id].criteria)[0];
+					const confidence = script.perQuestion?.[id]?.confidence ?? script.confidence ?? 0.9;
+					return [id, { type: "choice", choice, probabilities: { [choice]: confidence }, confidence }];
+				}),
+		);
+		return { answers };
 	};
 	return { judge, calls };
 }
@@ -82,14 +96,30 @@ async function runTierChecks(): Promise<void> {
 	assert.match(failure.reason, /forced judge failure/);
 	lines.push(formatLog(failure, failureEvent, when));
 
-	const floor = await decide({ event: baseEvent, pending: pending("Update the unit tests and run npm test"), currentModel, config, judge: scripted({ choice: "quick" }).judge });
-	assert.equal(floor.action, "apply");
-	if (floor.action === "apply") assert.equal(floor.tier, "medium");
+	const testWriting = scripted({ choice: "quick", confidence: 0.9 });
+	const written = await decide({
+		event: baseEvent,
+		pending: pending("Add unit tests for slugify in test/slugify.test.ts following the existing cases, then run bun test"),
+		currentModel,
+		config,
+		judge: testWriting.judge,
+	});
+	assert.equal(written.action, "apply");
+	if (written.action === "apply") {
+		assert.equal(written.tier, "quick");
+		assert.equal(written.model, "@smol");
+		assert.equal(written.reason, "jev choice");
+	}
+	const tierInstructions = testWriting.calls[0].questions.model_tier.instructions;
+	assert.match(tierInstructions, /writes or extends tests following existing patterns can be quick/);
+	assert.match(tierInstructions, /Debugging failing tests, fixing flaky tests, or test-infrastructure changes are medium or above/);
+	assert.match(tierInstructions, /When unsure between two tiers, pick the higher one/);
+	assert.doesNotMatch(tierInstructions, /never quick/);
 
 	const secret = await decide({ event: baseEvent, pending: pending("Summarize API_KEY=secret-value-1234567890 and auth config"), currentModel, config, judge: scripted({ choice: "quick" }).judge });
 	assert.ok(!formatLog(secret, baseEvent).includes("secret-value-1234567890"));
 	console.log(lines.join("\n"));
-	console.log("PASS tier: heavy / medium / quick, judge failure fail-open, test floor, log redaction, native question shape");
+	console.log("PASS tier: heavy / medium / quick, judge failure fail-open, test-writing can be quick, log redaction, native question shape");
 }
 
 // The default `task` agent resolves through the `task` role; that alone is not a pin.
@@ -126,6 +156,113 @@ async function runTimeoutCheck(): Promise<void> {
 	);
 	assert.ok(Date.now() - started < 1000, "timeout must cap the wait");
 	console.log(`PASS timeout: a hung judge settles after ${Date.now() - started}ms (cap 80ms in this test, 3000ms in production)`);
+}
+
+// ---------------------------------------------------------------- spawn timeout scaling
+
+async function runTimeoutScalingChecks(): Promise<void> {
+	for (const [base, chars, expected] of [
+		[3000, 0, 3000],
+		[3000, 1000, 3000],
+		[3000, 4500, 5500],
+		[3000, 8000, 8000],
+		[3000, 50_000, 8000],
+		[5000, 4500, 6500],
+	] as const) {
+		assert.equal(spawnTimeoutMs(base, chars), expected, `spawnTimeoutMs(${base}, ${chars})`);
+	}
+	assert.equal(parseConfig({ timeoutMs: 6000 }).timeoutMs, 6000);
+	assert.equal(parseConfig({ timeoutMs: 20_000 }).timeoutMs, TIMEOUT_CAP_MS, "config may raise the timeout but never past the 8s cap");
+	assert.equal(parseConfig({ timeoutMs: 0 }).timeoutMs, 3000);
+	assert.equal(parseConfig({ timeoutMs: "x" }).timeoutMs, 3000);
+
+	// ~2.2k characters of state: Jev answers after 3.2s, past the 3s base but inside the scaled ~3.9s.
+	const longTask = "Adjust the importer carefully. ".repeat(50);
+	const long = await decide({
+		event: baseEvent,
+		pending: pending(longTask, "Shared background. ".repeat(32)),
+		currentModel,
+		config,
+		judge: scripted({ choice: "medium", confidence: 0.9, delayMs: 3200 }).judge,
+	});
+	assert.equal(long.action, "apply", "a long task must not time out at the 3s base");
+	const short = await decide({ event: baseEvent, pending: pending("Fix the typo in src/a.ts"), currentModel, config, judge: scripted({ choice: "medium", confidence: 0.9, delayMs: 3300 }).judge });
+	assert.equal(short.action, "skip");
+	assert.match(short.reason, /jev error: timeout after 3000ms/, "a short state keeps the base cap");
+	console.log("PASS timeout scaling: spawn timeout grows with state size, config capped at 8s, long task survives 3.2s Jev, short task still capped at 3s");
+}
+
+// ---------------------------------------------------------------- batched spawn tiering
+
+async function runBatchChecks(): Promise<void> {
+	rmSync(logFile, { force: true });
+	delete process.env.JEV_TIER;
+	delete process.env.JEV_PLAN;
+	type Routed = { model?: string } | undefined;
+	const item = (name: string, extra: Record<string, unknown> = {}) => ({ name, agent: "task", task: `Work item ${name}: adjust src/${name}.ts`, ...extra });
+	const send = (h: Harness, tasks: unknown[], context = "Shared batch context") =>
+		h.handlers.tool_call({ toolName: "task", input: { context, tasks } }, h.context);
+	const spawn = async (h: Harness, name: string) =>
+		((await h.handlers.before_subagent_spawn({ ...baseEvent, modelRole: "task", spawnKey: name }, h.context)) as Routed)?.model;
+	const spawnAll = (h: Harness, names: string[]) => Promise.all(names.map((name) => spawn(h, name)));
+	const perQuestion = {
+		model_tier_0: { choice: "heavy", confidence: 0.95 },
+		model_tier_1: { choice: "medium", confidence: 0.9 },
+		model_tier_2: { choice: "quick", confidence: 0.92 },
+	};
+	const named = (prefix: string) => [`${prefix}1`, `${prefix}2`, `${prefix}3`];
+
+	// 1. three concurrent spawns of one task call: one request, one answer each
+	const okNames = named("BatchOk");
+	const ok = harness({ perQuestion });
+	send(ok, okNames.map((n) => item(n)));
+	assert.deepEqual(await spawnAll(ok, okNames), ["@slow", "@default", "@smol"]);
+	assert.equal(ok.calls.length, 1, "one judgment for the whole task call");
+	assert.deepEqual(Object.keys(ok.calls[0].questions), ["model_tier_0", "model_tier_1", "model_tier_2"]);
+	assert.deepEqual((ok.calls[0].state.tasks as { name: string }[]).map((t) => t.name), okNames);
+	assert.match(ok.calls[0].questions.model_tier_1.instructions, /`tasks\[1\]`/);
+	assert.equal(ok.calls[0].purpose, "jev-tier:model_tier");
+
+	// 2. a member held back by concurrency limits spawns later: still no second request
+	const lateNames = named("BatchLate");
+	const late = harness({ perQuestion });
+	send(late, lateNames.map((n) => item(n)));
+	assert.deepEqual(await spawnAll(late, lateNames.slice(0, 2)), ["@slow", "@default"]);
+	assert.equal(await spawn(late, lateNames[2]), "@smol");
+	assert.equal(late.calls.length, 1);
+
+	// 3. judge failure: every member fails open, logged as today, one request
+	const failNames = named("BatchFail");
+	const failed = harness({ fail: true });
+	send(failed, failNames.map((n) => item(n)));
+	assert.deepEqual(await spawnAll(failed, failNames), [undefined, undefined, undefined]);
+	assert.equal(failed.calls.length, 1);
+	const failLines = readFileSync(logFile, "utf8").split("\n").filter((line) => line.includes("spawn=BatchFail"));
+	assert.equal(failLines.length, 3);
+	assert.ok(failLines.every((line) => line.includes('reason="jev error: forced judge failure"')));
+
+	// 4. one unusable answer fails open for that spawn alone
+	const omitNames = named("BatchOmit");
+	const omitted = harness({ perQuestion, omit: ["model_tier_1"] });
+	send(omitted, omitNames.map((n) => item(n)));
+	assert.deepEqual(await spawnAll(omitted, omitNames), ["@slow", undefined, "@smol"]);
+
+	// 5. an explicit model keeps that item out of the request
+	const [a, b, c] = named("BatchExplicit");
+	const explicit = harness({ perQuestion: { model_tier_0: perQuestion.model_tier_0, model_tier_1: perQuestion.model_tier_2 } });
+	send(explicit, [item(a), item(b, { model: "@smol" }), item(c)]);
+	assert.deepEqual(await spawnAll(explicit, [a, b, c]), ["@slow", undefined, "@smol"]);
+	assert.equal(explicit.calls.length, 1);
+	assert.deepEqual(Object.keys(explicit.calls[0].questions), ["model_tier_0", "model_tier_1"]);
+	assert.deepEqual((explicit.calls[0].state.tasks as { name: string }[]).map((t) => t.name), [a, c]);
+
+	// 6. a big batch gets a longer budget: Jev answers after 3.3s, past the 3s base
+	const slowNames = named("BatchSlow");
+	const slow = harness({ choice: "medium", confidence: 0.9, delayMs: 3300 });
+	send(slow, slowNames.map((n) => item(n, { task: "Refactor the importer. ".repeat(55) })), "Shared background. ".repeat(32));
+	assert.deepEqual(await spawnAll(slow, slowNames), ["@default", "@default", "@default"]);
+	assert.equal(slow.calls.length, 1);
+	console.log("PASS batch: one judgment per task call, per-spawn answers, late member, failure and unusable answer fail open, explicit model excluded, scaled budget");
 }
 
 // ---------------------------------------------------------------- magic keywords
@@ -169,7 +306,14 @@ interface Scenario extends Script {
 const logFile = join(tmpdir(), "jev-tier-test.log");
 type Handler = (event: unknown, context: ExtensionContext) => unknown;
 
-function harness(scenario: Scenario = {}) {
+interface Harness {
+	handlers: Record<string, Handler>;
+	calls: JudgeRequest[];
+	notices: string[];
+	context: ExtensionContext;
+}
+
+function harness(scenario: Scenario = {}): Harness {
 	const handlers: Record<string, Handler> = {};
 	const { judge, calls } = scripted(scenario);
 	register(
@@ -365,6 +509,8 @@ async function runSingleCallChecks(): Promise<void> {
 await runTierChecks();
 await runPinChecks();
 await runTimeoutCheck();
+await runTimeoutScalingChecks();
+await runBatchChecks();
 runKeywordChecks();
 runExplicitPlanChecks();
 await runPlanChecks();

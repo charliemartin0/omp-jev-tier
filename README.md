@@ -1,18 +1,20 @@
 # Jev router (subagent tiers + automatic plan mode)
 
-One user-level omp extension; nothing in omp is patched and your model roles, fallback chains and usage reserve are untouched. Both features ask Jev one Choice question per decision through **omp's own judge** (`@oh-my-pi/pi-coding-agent/judgment`), the same plumbing the auto-thinking classifier and `judge()` use:
+One user-level omp extension; nothing in omp is patched and your model roles, fallback chains and usage reserve are untouched. Both features ask Jev Choice questions through **omp's own judge** (`@oh-my-pi/pi-coding-agent/judgment`), the same plumbing the auto-thinking classifier and `judge()` use. Plan detection asks one question per message; subagent tiering asks one question per spawn, or one request with a question per item when a `task` call carries several:
 
 - the `judge` model role and its chain (default `typesafe/jev-latest` first), credentials from `TYPESAFE_API_KEY` or `/login typesafe`, gateway `baseUrl` honoured;
 - omp's shared judgment cache (`~/.omp/cache/judgment-cache.db`): an identical state + question is not billed twice;
 - usage journaling and telemetry like any other native judgment (purpose `jev-tier:model_tier` / `jev-tier:plan_route`).
 
-Only a native Jev candidate may answer. If the `judge` role would resolve to a prompted chat or on-device model, the judgment is refused rather than turning a cheap Jev decision into a paid LLM call. Everything fails open: a judge error, a 3s cap (`AbortSignal` plus a hard race), or low confidence leaves omp exactly as it would have behaved.
+Only a native Jev candidate may answer. If the `judge` role would resolve to a prompted chat or on-device model, the judgment is refused rather than turning a cheap Jev decision into a paid LLM call. Everything fails open: a judge error, a timeout (`AbortSignal` plus a hard race; 3s base, scaled up to 8s with the amount of text sent), or low confidence leaves omp exactly as it would have behaved.
 
 Files: `index.ts` (omp entry: native judge, `plan.enabled` and magic-keyword settings), `register.ts` (hooks, logging), `core.ts` (subagent tiers, `askChoice`), `plan.ts` (plan detection), `test.ts` (mocked harness).
 
 ## 1. Subagent tier (`before_subagent_spawn`)
 
-Picks heavy / medium / quick per spawn and returns `@slow` / `@default` / `@smol`. The spawn event carries no task text, so task-tool inputs are captured from `tool_call` and matched on `spawnKey`; eval `agent()` spawns and unnamed tasks fail open. Confidence floor 0.7; a quick verdict for work that runs tests is raised to medium.
+Picks heavy / medium / quick per spawn and returns `@slow` / `@default` / `@smol`. The spawn event carries no task text, so task-tool inputs are captured from `tool_call` and matched on `spawnKey`; eval `agent()` spawns and unnamed tasks fail open. Confidence floor 0.7. Writing or extending tests that follow existing patterns can be quick; debugging failing tests, fixing flaky tests and test-infrastructure changes are medium or above.
+
+A `task` call with two or more judgable items (named, with task text, no explicit `model`) is judged in one batched request: one `model_tier_<i>` question per item over a shared `tasks[]` state, and each spawn reads its own answer (log reason `jev choice (batch of N)`). A failed or timed-out batch fails open for every member. A single-item call sends one `model_tier` question. The timeout is 3s up to 1000 characters of state, rising linearly to 8s at 8000 characters, so a batch of several long prompts gets a longer budget.
 
 Never overridden: an explicit `model` on the task call, an agent that pins a role other than `task` (e.g. `scout` = `smol`), and any spawn whose resolved model differs from the parent's (catches `task.agentModelOverrides` and a `modelRoles.task` pointing elsewhere). The default agent's own `task` role is not a pin by itself.
 
@@ -43,7 +45,7 @@ To skip detection for one message, say so in it: "no plan", "skip planning", "do
 
 - Whole extension: `JEV_TIER=off omp`.
 - Plan detection only: `JEV_PLAN=off`.
-- Persistent: `~/.omp/agent/extensions/jev-tier/config.json`, e.g. `{"enabled": false}` or `{"planEnabled": false}`. Tuning keys: `timeoutMs` (1-3000; the plan check scales it up to 8s as the message grows from 500 to 2000 characters; a timeout fails open and is logged as `jev error: timeout after Nms`), `minConfidence` (tiers, 0.7), `planMinConfidence` (0.6).
+- Persistent: `~/.omp/agent/extensions/jev-tier/config.json`, e.g. `{"enabled": false}` or `{"planEnabled": false}`. Tuning keys: `timeoutMs` (base timeout in ms, 1-8000, default 3000; values above 8000 clamp to 8000; subagent tiering scales it up to 8s with the state size; plan checks keep a 3s base at most and scale it up to 8s as the message grows from 500 to 2000 characters; a timeout fails open and is logged as `jev error: timeout after Nms`), `minConfidence` (tiers, 0.7), `planMinConfidence` (0.6).
 
 ## Test
 

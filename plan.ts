@@ -1,6 +1,6 @@
 // Automatic plan-mode detection for the jev-tier extension. Pure logic, no omp imports.
 
-import { askChoice, extractPaths, redact, rubric, summarize, type ChoiceQuestion, type Config, type JudgeFn } from "./core";
+import { DEFAULT_CONFIG, askChoice, extractPaths, redact, rubric, scaledTimeoutMs, summarize, type ChoiceQuestion, type Config, type JudgeFn } from "./core";
 
 export type PlanVerdict = "plan" | "direct";
 
@@ -63,14 +63,12 @@ export function explicitPlanRequest(text: string): boolean {
 
 // Jev sees at most this many characters of the message.
 const PLAN_STATE_CHARS = 2000;
-const PLAN_TIMEOUT_MAX_MS = 8000;
 const PLAN_SCALE_FROM_CHARS = 500;
 
 // The Jev call gets the base timeout for short messages, rising linearly to 8s as the message sent grows from
 // 500 to 2000 characters, so a long pasted spec is not cut off at the short-message budget.
 export function planTimeoutMs(baseMs: number, chars: number): number {
-	const fraction = Math.min(1, Math.max(0, (chars - PLAN_SCALE_FROM_CHARS) / (PLAN_STATE_CHARS - PLAN_SCALE_FROM_CHARS)));
-	return Math.max(baseMs, Math.round(baseMs + (PLAN_TIMEOUT_MAX_MS - baseMs) * fraction));
+	return scaledTimeoutMs(baseMs, chars, PLAN_SCALE_FROM_CHARS, PLAN_STATE_CHARS);
 }
 
 // Leading syntax omp interprets itself: slash commands, `!`/`!!` shell, `$`/`$$` python, `->`/`=>` steer.
@@ -212,7 +210,8 @@ export async function decidePlan(input: PlanDecideInput): Promise<PlanDecision> 
 			question: planQuestion(),
 			choices: PLAN_VERDICTS,
 			purpose: "jev-tier:plan_route",
-			timeoutMs: planTimeoutMs(config.timeoutMs, sent.length),
+			// The config may raise `timeoutMs` for spawn tiering; plan routing keeps its 3s base, as before that was allowed.
+			timeoutMs: planTimeoutMs(Math.min(config.timeoutMs, DEFAULT_CONFIG.timeoutMs), sent.length),
 		});
 	} catch (error) {
 		const msg = redact(error instanceof Error ? error.message : String(error), secrets).slice(0, 120);
